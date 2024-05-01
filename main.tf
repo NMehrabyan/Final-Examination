@@ -8,7 +8,7 @@ data "aws_availability_zones" "available" {}
 locals {
   name            = "ex-${replace(basename(path.cwd), "_", "-")}"
   cluster_version = "1.29"
-  region          = "eu-west-1"
+  region          = "us-east-2"
 
   vpc_cidr = "10.0.0.0/16"
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
@@ -25,7 +25,7 @@ locals {
 ################################################################################
 
 module "eks" {
-  source = "../.."
+  source = "terraform-aws-modules/eks/aws"
 
   cluster_name                   = local.name
   cluster_version                = local.cluster_version
@@ -65,253 +65,48 @@ module "eks" {
     autoscaling_group_tags = {
       "k8s.io/cluster-autoscaler/enabled" : true,
       "k8s.io/cluster-autoscaler/${local.name}" : "owned",
+      ami_type = "AL2_x86_64"
     }
   }
 
-  self_managed_node_groups = {
-    # Default node group - as provisioned by the module defaults
-    default_node_group = {}
+ 
+}
 
-    # AL2023 node group utilizing new user data format which utilizes nodeadm
-    # to join nodes to the cluster (instead of /etc/eks/bootstrap.sh)
-    al2023_nodeadm = {
-      platform = "al2023"
 
-      cloudinit_pre_nodeadm = [
-        {
-          content_type = "application/node.eks.aws"
-          content      = <<-EOT
-            ---
-            apiVersion: node.eks.aws/v1alpha1
-            kind: NodeConfig
-            spec:
-              kubelet:
-                config:
-                  shutdownGracePeriod: 30s
-                  featureGates:
-                    DisableKubeletCloudCredentialProviders: true
-          EOT
-        }
-      ]
-    }
 
-    # Bottlerocket node group
-    bottlerocket = {
-      name = "bottlerocket-self-mng"
+module "eks_managed_node_group" {
+  source = "terraform-aws-modules/eks/aws//modules/eks-managed-node-group"
 
-      platform      = "bottlerocket"
-      ami_id        = data.aws_ami.eks_default_bottlerocket.id
-      instance_type = "m5.large"
-      desired_size  = 2
-      key_name      = module.key_pair.key_pair_name
+  name                 = "separate-eks-mng"
+  cluster_name         = module.eks.cluster_name
+  cluster_ip_family    = module.eks.cluster_ip_family
+  cluster_service_cidr = module.eks.cluster_service_cidr
 
-      bootstrap_extra_args = <<-EOT
-        # The admin host container provides SSH access and runs with "superpowers".
-        # It is disabled by default, but can be disabled explicitly.
-        [settings.host-containers.admin]
-        enabled = false
+  subnet_ids                        = module.vpc.private_subnets
+  cluster_primary_security_group_id = module.eks.cluster_primary_security_group_id
+  vpc_security_group_ids = [
+    module.eks.node_security_group_id,
+  ]
 
-        # The control host container provides out-of-band access via SSM.
-        # It is enabled by default, and can be disabled if you do not expect to use SSM.
-        # This could leave you with no way to access the API and change settings on an existing node!
-        [settings.host-containers.control]
-        enabled = true
-
-        # extra args added
-        [settings.kernel]
-        lockdown = "integrity"
-
-        [settings.kubernetes.node-labels]
-        label1 = "foo"
-        label2 = "bar"
-
-        [settings.kubernetes.node-taints]
-        dedicated = "experimental:PreferNoSchedule"
-        special = "true:NoSchedule"
-      EOT
-    }
-
-    mixed = {
-      name = "mixed"
-
-      min_size     = 1
-      max_size     = 5
-      desired_size = 2
-
-      bootstrap_extra_args = "--kubelet-extra-args '--node-labels=node.kubernetes.io/lifecycle=spot'"
-
-      use_mixed_instances_policy = true
-      mixed_instances_policy = {
-        instances_distribution = {
-          on_demand_base_capacity                  = 0
-          on_demand_percentage_above_base_capacity = 20
-          spot_allocation_strategy                 = "capacity-optimized"
-        }
-
-        override = [
-          {
-            instance_type     = "m5.large"
-            weighted_capacity = "1"
-          },
-          {
-            instance_type     = "m6i.large"
-            weighted_capacity = "2"
-          },
-        ]
-      }
-    }
-
-    # Complete
-    complete = {
-      name            = "complete-self-mng"
-      use_name_prefix = false
-
-      subnet_ids = module.vpc.public_subnets
-
-      min_size     = 1
-      max_size     = 7
-      desired_size = 1
-
-      ami_id = data.aws_ami.eks_default.id
-
-      pre_bootstrap_user_data = <<-EOT
-        export FOO=bar
-      EOT
-
-      post_bootstrap_user_data = <<-EOT
-        echo "you are free little kubelet!"
-      EOT
-
-      instance_type = "m6i.large"
-
-      launch_template_name            = "self-managed-ex"
-      launch_template_use_name_prefix = true
-      launch_template_description     = "Self managed node group example launch template"
-
-      ebs_optimized     = true
-      enable_monitoring = true
-
-      block_device_mappings = {
-        xvda = {
-          device_name = "/dev/xvda"
-          ebs = {
-            volume_size           = 75
-            volume_type           = "gp3"
-            iops                  = 3000
-            throughput            = 150
-            encrypted             = true
-            kms_key_id            = module.ebs_kms_key.key_arn
-            delete_on_termination = true
-          }
-        }
-      }
-
-      instance_attributes = {
-        name = "instance-attributes"
-
-        min_size     = 1
-        max_size     = 2
-        desired_size = 1
-
-        bootstrap_extra_args = "--kubelet-extra-args '--node-labels=node.kubernetes.io/lifecycle=spot'"
-
-        instance_type = null
-
-        # launch template configuration
-        instance_requirements = {
-          cpu_manufacturers                           = ["intel"]
-          instance_generations                        = ["current", "previous"]
-          spot_max_price_percentage_over_lowest_price = 100
-
-          vcpu_count = {
-            min = 1
-          }
-
-          allowed_instance_types = ["t*", "m*"]
-        }
-
-        use_mixed_instances_policy = true
-        mixed_instances_policy = {
-          instances_distribution = {
-            on_demand_base_capacity                  = 0
-            on_demand_percentage_above_base_capacity = 0
-            on_demand_allocation_strategy            = "lowest-price"
-            spot_allocation_strategy                 = "price-capacity-optimized"
-          }
-
-          # ASG configuration
-          override = [
-            {
-              instance_requirements = {
-                cpu_manufacturers                           = ["intel"]
-                instance_generations                        = ["current", "previous"]
-                spot_max_price_percentage_over_lowest_price = 100
-
-                vcpu_count = {
-                  min = 1
-                }
-
-                allowed_instance_types = ["t*", "m*"]
-              }
-            }
-          ]
-        }
-      }
-
-      metadata_options = {
-        http_endpoint               = "enabled"
-        http_tokens                 = "required"
-        http_put_response_hop_limit = 2
-        instance_metadata_tags      = "disabled"
-      }
-
-      create_iam_role          = true
-      iam_role_name            = "self-managed-node-group-complete-example"
-      iam_role_use_name_prefix = false
-      iam_role_description     = "Self managed node group complete example role"
-      iam_role_tags = {
-        Purpose = "Protector of the kubelet"
-      }
-      iam_role_additional_policies = {
-        AmazonEC2ContainerRegistryReadOnly = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-        additional                         = aws_iam_policy.additional.arn
-      }
-
-      tags = {
-        ExtraTag = "Self managed node group complete example"
-      }
-    }
-
-    efa = {
-      # Disabling automatic creation due to instance type/quota availability
-      # Can be enabled when appropriate for testing/validation
-      create = false
-
-      instance_type = "trn1n.32xlarge"
-
-      enable_efa_support      = true
-      pre_bootstrap_user_data = <<-EOT
-        # Mount NVME instance store volumes since they are typically
-        # available on instances that support EFA
-        setup-local-disks raid0
-      EOT
+  ami_type = "BOTTLEROCKET_x86_64"
+  platform = "bottlerocket"
+  instance_types = ["t2.micro"]
 
       min_size     = 2
       max_size     = 2
       desired_size = 2
-    }
-  }
+  # this will get added to what AWS provides
+  bootstrap_extra_args = <<-EOT
+    # extra args added
+    [settings.kernel]
+    lockdown = "integrity"
 
-  tags = local.tags
-}
+    [settings.kubernetes.node-labels]
+    "label1" = "foo"
+    "label2" = "bar"
+  EOT
 
-module "disabled_self_managed_node_group" {
-  source = "../../modules/self-managed-node-group"
-
-  create = false
-
-  # Hard requirement
-  cluster_service_cidr = ""
+  tags = merge(local.tags, { Separate = "eks-managed-node-group" })
 }
 
 ################################################################################
